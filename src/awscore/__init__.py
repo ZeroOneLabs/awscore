@@ -1,4 +1,4 @@
-# ***REMOVED***/__init__.py
+# awscore/__init__.py
 import logging
 from typing import Any
 

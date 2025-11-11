@@ -1,11 +1,11 @@
-# ***REMOVED***/meta/metadata.py
+# awscore/meta/metadata.py
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Any
 import json
 import urllib.parse
 import boto3
-from ***REMOVED*** import AutoLogger
+from awscore import AutoLogger
 
 class MetaData(AutoLogger):
     """

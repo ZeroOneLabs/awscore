@@ -1,4 +1,4 @@
-# ***REMOVED***/db/postgres/connection.py
+# awscore/db/postgres/connection.py
 import logging
 from contextlib import contextmanager
 from typing import Optional, Generator
@@ -6,7 +6,7 @@ import boto3
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extensions import connection as PgConn
-from ***REMOVED*** import AutoLogger
+from awscore import AutoLogger
 
 log = logging.getLogger(__name__)
 

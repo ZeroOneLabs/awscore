@@ -1,11 +1,11 @@
-# ***REMOVED***/aws/config/aws_config.py
+# awscore/aws/config/aws_config.py
 from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional
 import boto3
 import toml
-from ***REMOVED*** import AutoLogger
+from awscore import AutoLogger
 
 DEFAULT_CONFIG_PATH = Path.cwd() / "config.toml"
 HOME_AWS = Path.home() / ".aws"

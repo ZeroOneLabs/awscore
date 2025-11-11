@@ -1,9 +1,9 @@
-# ***REMOVED***/db/postgres/client.py
+# awscore/db/postgres/client.py
 from __future__ import annotations
 from typing import Optional, Dict, Any, List
 from psycopg2.extensions import connection as PgConn
 from psycopg2 import sql
-from ***REMOVED*** import AutoLogger
+from awscore import AutoLogger
 from .connection import PostgresConnectionPool
 
 class Postgres(AutoLogger):

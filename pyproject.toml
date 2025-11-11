@@ -1,0 +1,12 @@
+# pyproject.toml (uv manages this automatically)
+[project]
+name = "myapp"
+version = "0.1.0"
+dependencies = [
+    "fastapi>=0.115", 
+    "uvicorn[standard]", 
+    "pydantic-settings"
+]
+
+[tool.uv]
+# Auto-generates uv.lock (like poetry.lock but 10× faster)

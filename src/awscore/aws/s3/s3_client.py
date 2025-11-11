@@ -1,9 +1,9 @@
-# ***REMOVED***/aws/s3/s3_client.py
+# awscore/aws/s3/s3_client.py
 from __future__ import annotations
 from typing import IO, Any
 import boto3
 from botocore.exceptions import ClientError
-from ***REMOVED*** import AutoLogger
+from awscore import AutoLogger
 from ..config.aws_config import AwsConfig
 
 class S3(AutoLogger):

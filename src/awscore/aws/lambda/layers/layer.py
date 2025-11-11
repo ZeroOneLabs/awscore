@@ -1,10 +1,10 @@
-# ***REMOVED***/aws/lambda_/layers/layer.py
+# awscore/aws/lambda_/layers/layer.py
 from __future__ import annotations
 import zipfile
 import io
 from pathlib import Path
 from typing import IO
-from ***REMOVED*** import AutoLogger
+from awscore import AutoLogger
 
 class Layer(AutoLogger):
     """

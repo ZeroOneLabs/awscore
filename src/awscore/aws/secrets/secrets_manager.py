@@ -1,9 +1,9 @@
-# ***REMOVED***/aws/secrets/secrets_manager.py
+# awscore/aws/secrets/secrets_manager.py
 from __future__ import annotations
 from typing import Dict, Any
 import boto3
 import json
-from ***REMOVED*** import AutoLogger
+from awscore import AutoLogger
 from ..config.aws_config import AwsConfig
 
 class SecretsManager(AutoLogger):

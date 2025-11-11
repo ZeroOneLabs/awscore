@@ -1,4 +1,4 @@
-# ***REMOVED***/logging.py
+# awscore/logging.py
 import logging
 import json
 from datetime import datetime

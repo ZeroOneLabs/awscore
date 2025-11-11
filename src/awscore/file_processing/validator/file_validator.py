@@ -1,11 +1,11 @@
-# ***REMOVED***/file_processing/validator/file_validator.py
+# awscore/file_processing/validator/file_validator.py
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import csv
 import re
 import xml.etree.ElementTree as ET
-from ***REMOVED*** import AutoLogger
+from awscore import AutoLogger
 
 
 class FileValidator(AutoLogger):
