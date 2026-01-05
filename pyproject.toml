@@ -1,12 +1,46 @@
-# pyproject.toml (uv manages this automatically)
 [project]
-name = "myapp"
+name = "aws_core"
 version = "0.1.0"
 dependencies = [
-    "fastapi>=0.115", 
-    "uvicorn[standard]", 
+    "boto3",
+    "uvicorn[standard]",
     "pydantic-settings"
 ]
 
-[tool.uv]
-# Auto-generates uv.lock (like poetry.lock but 10× faster)
+[project.env.vars]
+LOG_LEVEL = "INFO"
+
+[project.env.vars.AWS_PROFILE]
+dev = "my-company-dev"
+uat = "my-company-uat"
+prod = "my-company-prod"
+
+# [project.env.vars.AWS_REGION]
+# dev = "us-east-1"
+# uat = "us-east-1"
+# prod = "us-east-1"
+
+# Database environment-specific configs
+[database]
+engine = "postgres"
+port = "5432"
+connect_timeout = 60
+sslmode = "require"
+dbname = "pg"
+username = "pg_user"
+
+[database.dev]
+secret = "PROJECT-DEV-DB"
+host = "dev-db.internal"
+database = "myapp_dev"
+
+[database.uat]
+secret = "PROJECT-UAT-DB"
+host = "uat-db.internal"
+database = "myapp_uat"
+
+[database.prod]
+username = "prod_pg_user"
+secret = "PROJECT-PRD-DB"
+host = "prod-db.internal"
+database = "myapp_prod"
