@@ -1,24 +1,21 @@
 """
 Core configuration module for Lambda application framework.
 
-Handles loading configuration from multiple sources with precedence:
-1. Environment variables (highest priority)
-2. AWS Lambda environment context
-3. Local configuration files (lowest priority)
-
-Automatically manages AWS credentials and regional configuration.
+Handles loading configuration from pyproject.toml and environment variables.
 """
 
 import os
 import tomllib
-import yaml
-import json
-import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict
-from dataclasses import dataclass, field
-import threading
 import importlib.util
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+except ImportError:
+    boto3 = None
 
 
 class ConfigError(Exception):
@@ -33,7 +30,6 @@ class DependencyError(Exception):
     pass
 
 
-@dataclass
 class AWSConfig:
     """AWS-specific configuration settings."""
 
@@ -42,8 +38,13 @@ class AWSConfig:
     credentials_path: Path | None = None
     lambda_name: str | None = None
     environment: str | None = None
+    project: str | None = None
+    function: str | None = None
 
-    def __post_init__(self):
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
         if self.credentials_path and isinstance(self.credentials_path, str):
             self.credentials_path = Path(self.credentials_path).expanduser()
 
@@ -52,23 +53,22 @@ class Config:
     """
     Central configuration management for Lambda applications (Singleton).
 
-    Loads and merges configuration from:
-    - project.toml (project metadata and defaults)
-    - config.toml/config.yaml (application configuration)
-    - .env files (environment-specific overrides)
+    Loads configuration from:
+    - pyproject.toml (primary configuration source)
+    - Environment variables (override config values)
     - AWS Lambda context (runtime environment detection)
-    - Environment variables (highest priority overrides)
 
     Singleton pattern ensures configuration is loaded once per container lifecycle.
 
     Example:
         >>> config = Config()  # Returns same instance everywhere
+        >>> config.load()
         >>> db_host = config.get('database.host')
         >>> aws_region = config.aws.region
     """
 
     _instance: "Config" | None = None
-    _lock = None  # Will be initialized as threading.Lock on first use
+    _lock = None
 
     def __new__(cls, project_root: Path | None = None):
         """
@@ -77,8 +77,6 @@ class Config:
         Thread-safe implementation for concurrent Lambda invocations.
         """
         if cls._lock is None:
-            import threading
-
             cls._lock = threading.Lock()
 
         if cls._instance is None:
@@ -86,27 +84,38 @@ class Config:
                 # Double-check locking pattern
                 if cls._instance is None:
                     instance = super().__new__(cls)
-                    instance._initialized = False
+                    # Initialize all attributes here (only runs once)
+                    instance.project_root = Path(project_root or os.getcwd())
+                    instance._config: Dict[str, Any] = {}
+                    instance._aws_config: AWSConfig | None = None
+                    instance._loaded = False
+                    instance._logger = (
+                        None  # Lazy-load logger to avoid circular dependency
+                    )
                     cls._instance = instance
 
         return cls._instance
 
     def __init__(self, project_root: Path | None = None):
         """
-        Initialize configuration loader (only runs once due to singleton).
+        Initialize configuration loader (no-op after first instantiation).
 
         Args:
-            project_root: Root directory of the project. Defaults to current working directory.
+            project_root: Root directory of the project (only used on first instantiation).
         """
-        # Prevent re-initialization
-        if self._initialized:
-            return
+        # __init__ is called every time, but __new__ ensures singleton
+        # All initialization happens in __new__, so this is effectively a no-op
+        pass
 
-        self.project_root = Path(project_root or os.getcwd())
-        self._config: Dict[str, Any] = {}
-        self._aws_config: AWSConfig | None = None
-        self._loaded = False
-        self._initialized = True
+    @property
+    def logger(self):
+        """Lazy-load logger to avoid circular import issues."""
+        if self._logger is None:
+            # Import here to avoid circular dependency
+            from .logging import Logger
+
+            self._logger = Logger()
+        return self._logger
 
     def load(self) -> "Config":
         """
@@ -122,11 +131,10 @@ class Config:
             return self
 
         # Load in order (later sources override earlier)
-        self._load_project_toml()
-        self._load_config_files()
-        self._load_env_file()
+        self._load_pyproject_toml()
         self._detect_lambda_environment()
         self._load_env_vars()
+        self._load_project_env_vars()
         self._validate_dependencies()
         self._initialize_aws_config()
         self._validate_aws_connection()
@@ -134,130 +142,19 @@ class Config:
         self._loaded = True
         return self
 
-    def _load_project_toml(self) -> None:
-        """Load project.toml for project metadata and base configuration."""
-        project_file = self.project_root / "project.toml"
-        if not project_file.exists():
-            raise ConfigError(f"Required project.toml not found at {project_file}")
+    def _load_pyproject_toml(self) -> None:
+        """Load pyproject.toml for all configuration."""
+        pyproject_file = self.project_root / "pyproject.toml"
+        if not pyproject_file.exists():
+            raise ConfigError(f"Required pyproject.toml not found at {pyproject_file}")
 
         try:
-            with open(project_file, "rb") as f:
+            with open(pyproject_file, "rb") as f:
                 data = tomllib.load(f)
                 self._merge_config(data)
 
-                # Load environment variables from [project.env.vars] into os.environ
-                # This enables boto3 to pick up AWS_PROFILE and other AWS settings
-                env_vars_config = data.get("project", {}).get("env", {}).get("vars", {})
-                if env_vars_config:
-                    self._load_environment_variables(env_vars_config)
         except Exception as e:
-            raise ConfigError(f"Failed to load project.toml: {e}")
-
-    def _load_environment_variables(self, env_vars_config: dict[str, Any]) -> None:
-        """
-        Load environment variables from config into os.environ.
-
-        Supports both direct values and environment-specific values:
-        [project.env.vars]
-        SOME_VAR = "value"  # Direct value
-
-        [project.env.vars.AWS_PROFILE]
-        dev = "my-company-dev"
-        uat = "my-company-uat"
-        prod = "my-company-prod"
-
-        Args:
-            env_vars_config: Environment variables configuration dict
-        """
-        for key, value in env_vars_config.items():
-            # Skip if already in environment (shell env vars take precedence)
-            if key in os.environ:
-                continue
-
-            # Check if value is environment-specific (dict with dev/uat/prod keys)
-            if isinstance(value, dict):
-                # This is an environment-specific variable
-                environment = self._config.get("environment") or self._config.get(
-                    "aws", {}
-                ).get("environment")
-
-                if environment and environment in value:
-                    env_value = str(value[environment])
-                    os.environ[key] = env_value
-                    self.logger.debug(
-                        f"Loaded environment variable: {key}={env_value}",
-                        extra={"environment": environment},
-                    )
-                else:
-                    # Environment not detected or not in config, skip
-                    self.logger.warning(
-                        f"Could not load environment-specific variable '{key}' - environment not detected or not configured"
-                    )
-            else:
-                # Direct value (not environment-specific)
-                os.environ[key] = str(value)
-                self.logger.debug(f"Loaded environment variable: {key}")
-
-    def _load_config_files(self) -> None:
-        """Load config.toml or config.yaml if present."""
-        # Try TOML first
-        config_toml = self.project_root / "config.toml"
-        if config_toml.exists():
-            try:
-                with open(config_toml, "rb") as f:
-                    data = tomllib.load(f)
-                    self._merge_config(data)
-                return
-            except Exception as e:
-                raise ConfigError(f"Failed to load config.toml: {e}")
-
-        # Fall back to YAML
-        config_yaml = self.project_root / "config.yaml"
-        if config_yaml.exists():
-            try:
-                with open(config_yaml, "r") as f:
-                    data = yaml.safe_load(f)
-                    if data:
-                        self._merge_config(data)
-                return
-            except Exception as e:
-                raise ConfigError(f"Failed to load config.yaml: {e}")
-
-    def _load_env_file(self) -> None:
-        """Load .env file for environment-specific variables."""
-        env_file = self.project_root / ".env"
-        if not env_file.exists():
-            return
-
-        try:
-            with open(env_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, value = line.split("=", 1)
-                        key = key.strip()
-                        value = value.strip().strip('"').strip("'")
-
-                        # Set in os.environ if not already set
-                        if key not in os.environ:
-                            os.environ[key] = value
-
-                        # Store in config under 'env' namespace
-                        self._set_nested(f"env.{key}", value)
-        except Exception as e:
-            # Non-critical, just log and continue
-            self.logger.warning(f"Failed to load .env file: {e}")
-
-    def _load_env_vars(self) -> None:
-        """Load environment variables with APP_ prefix into config."""
-        prefix = "APP_"
-        for key, value in os.environ.items():
-            if key.startswith(prefix):
-                # Convert APP_DATABASE_HOST to database.host
-                config_key = key[len(prefix) :].lower().replace("_", ".")
-                self._set_nested(config_key, value)
+            raise ConfigError(f"Failed to load pyproject.toml: {e}")
 
     def _detect_lambda_environment(self) -> None:
         """Detect if running in AWS Lambda and extract environment info."""
@@ -289,6 +186,87 @@ class Config:
             self._set_nested("aws.function", function)
             self._set_nested("environment", environment)
 
+    def _load_env_vars(self) -> None:
+        """Load environment variables with APP_ prefix into config."""
+        prefix = "APP_"
+        for key, value in os.environ.items():
+            if key.startswith(prefix):
+                # Convert APP_DATABASE_HOST to database.host
+                config_key = key[len(prefix) :].lower().replace("_", ".")
+                self._set_nested(config_key, value)
+
+    def _load_project_env_vars(self) -> None:
+        """
+        Load environment variables from [project.env.vars] into os.environ.
+
+        Supports two formats:
+
+        Format 1 (environment-first):
+        [project.env.vars.dev]
+        AWS_PROFILE = "profile-dev"
+        AWS_BUCKET = "bucket-dev"
+
+        Format 2 (variable-first):
+        [project.env.vars.AWS_PROFILE]
+        dev = "profile-dev"
+        uat = "profile-uat"
+
+        Format 3 (direct values):
+        [project.env.vars]
+        STATIC_VAR = "value"
+        """
+        env_vars_config = self._config.get("project", {}).get("env", {}).get("vars", {})
+        if not env_vars_config:
+            return
+
+        current_environment = self._config.get("environment") or self._config.get(
+            "aws", {}
+        ).get("environment")
+
+        # Check if using environment-first format (dev/uat/prod as keys)
+        if current_environment and current_environment in env_vars_config:
+            # Format 1: Environment-first structure
+            env_block = env_vars_config[current_environment]
+            if isinstance(env_block, dict):
+                for key, value in env_block.items():
+                    if key not in os.environ:
+                        os.environ[key] = str(value)
+                        self.logger.debug(
+                            f"Loaded environment variable: {key}={value}",
+                            extra={"environment": current_environment},
+                        )
+            return
+
+        # Format 2 & 3: Variable-first or direct values
+        for key, value in env_vars_config.items():
+            # Skip environment blocks (they would have been handled above)
+            if key in ["dev", "uat", "prod"] and isinstance(value, dict):
+                continue
+
+            # Skip if already in environment (shell env vars take precedence)
+            if key in os.environ:
+                continue
+
+            # Check if value is environment-specific (dict with dev/uat/prod keys)
+            if isinstance(value, dict):
+                # Format 2: Variable-first with environment sub-keys
+                if current_environment and current_environment in value:
+                    env_value = str(value[current_environment])
+                    os.environ[key] = env_value
+                    self.logger.debug(
+                        f"Loaded environment variable: {key}={env_value}",
+                        extra={"environment": current_environment},
+                    )
+                else:
+                    # Environment not detected or not in config
+                    self.logger.warning(
+                        f"Could not load environment-specific variable '{key}' - environment not detected or not configured"
+                    )
+            else:
+                # Format 3: Direct value (not environment-specific)
+                os.environ[key] = str(value)
+                self.logger.debug(f"Loaded environment variable: {key}")
+
     def _initialize_aws_config(self) -> None:
         """Initialize AWS configuration from loaded config data."""
         aws_data = self._config.get("aws", {})
@@ -299,16 +277,56 @@ class Config:
             credentials_path=aws_data.get("credentials_path"),
             lambda_name=aws_data.get("lambda_name"),
             environment=aws_data.get("environment"),
+            project=aws_data.get("project"),
+            function=aws_data.get("function"),
         )
+
+    def _validate_aws_connection(self) -> None:
+        """
+        Verify AWS credentials and region connectivity.
+
+        Raises:
+            ConfigError: If AWS connection cannot be established.
+        """
+        if boto3 is None:
+            # boto3 not installed - skip validation
+            return
+
+        try:
+            # Build session based on config
+            session_kwargs = {"region_name": self._aws_config.region}
+
+            if self._aws_config.use_local_credentials:
+                if self._aws_config.credentials_path:
+                    # Use specific credentials file
+                    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(
+                        self._aws_config.credentials_path
+                    )
+                # Otherwise boto3 will use default ~/.aws/credentials
+
+            session = boto3.Session(**session_kwargs)
+
+            # Test connection with STS get-caller-identity
+            sts = session.client("sts")
+            identity = sts.get_caller_identity()
+
+            # Store identity info in config for reference
+            self._set_nested("aws.account_id", identity.get("Account"))
+            self._set_nested("aws.arn", identity.get("Arn"))
+
+        except NoCredentialsError:
+            raise ConfigError(
+                "AWS credentials not found. Configure credentials or set "
+                "use_local_credentials=true in config."
+            )
+        except ClientError as e:
+            raise ConfigError(f"Failed to connect to AWS: {e}")
 
     def _validate_dependencies(self) -> None:
         """
         Validate that all required dependencies are installed.
 
-        Checks for dependencies in order of precedence:
-        1. pyproject.toml ([project.dependencies] or [tool.poetry.dependencies])
-        2. project.toml ([dependencies])
-        3. requirements.txt
+        Checks for dependencies in [project.dependencies] from pyproject.toml.
 
         Raises:
             DependencyError: If any required dependencies are missing.
@@ -336,56 +354,14 @@ class Config:
 
     def _load_required_dependencies(self) -> list[str]:
         """
-        Load required dependencies from available sources.
+        Load required dependencies from [project.dependencies].
 
         Returns:
             List of required package specifications.
         """
-        # Try pyproject.toml first (PEP 621 standard)
-        pyproject_file = self.project_root / "pyproject.toml"
-        if pyproject_file.exists():
-            try:
-                with open(pyproject_file, "rb") as f:
-                    data = tomllib.load(f)
-
-                    # Check PEP 621 format
-                    if "project" in data and "dependencies" in data["project"]:
-                        return data["project"]["dependencies"]
-
-                    # Check Poetry format
-                    if "tool" in data and "poetry" in data["tool"]:
-                        poetry_deps = data["tool"]["poetry"].get("dependencies", {})
-                        # Convert poetry dict format to list (skip python version)
-                        return [
-                            f"{pkg}{f'=={ver}' if isinstance(ver, str) else ''}"
-                            for pkg, ver in poetry_deps.items()
-                            if pkg != "python"
-                        ]
-            except Exception as e:
-                self.logger.warning(f"Failed to parse pyproject.toml dependencies: {e}")
-
-        # Try project.toml [dependencies] section
-        if "dependencies" in self._config:
-            deps = self._config["dependencies"]
-            if isinstance(deps, list):
-                return deps
-            elif isinstance(deps, dict):
-                return [
-                    f"{pkg}{f'=={ver}' if ver else ''}" for pkg, ver in deps.items()
-                ]
-
-        # Fall back to requirements.txt
-        requirements_file = self.project_root / "requirements.txt"
-        if requirements_file.exists():
-            try:
-                with open(requirements_file, "r") as f:
-                    return [
-                        line.strip()
-                        for line in f
-                        if line.strip() and not line.strip().startswith("#")
-                    ]
-            except Exception as e:
-                self.logger.warning(f"Failed to read requirements.txt: {e}")
+        # Check PEP 621 format in pyproject.toml
+        if "project" in self._config and "dependencies" in self._config["project"]:
+            return self._config["project"]["dependencies"]
 
         return []
 
@@ -398,7 +374,6 @@ class Config:
         - boto3==1.26.0
         - boto3>=1.26.0
         - boto3[extra]
-        - git+https://...#egg=package
 
         Args:
             requirement: Package requirement string
@@ -408,13 +383,6 @@ class Config:
         """
         requirement = requirement.strip()
 
-        # Handle git URLs
-        if requirement.startswith("git+") or requirement.startswith("http"):
-            if "#egg=" in requirement:
-                return requirement.split("#egg=")[-1].split("[")[0]
-            return requirement  # Return as-is if can't parse
-
-        # Handle standard package specs
         # Remove extras: package[extra] -> package
         if "[" in requirement:
             requirement = requirement.split("[")[0]
@@ -452,48 +420,6 @@ class Config:
                 return True
 
         return False
-
-    def _validate_aws_connection(self) -> None:
-        """
-        Verify AWS credentials and region connectivity.
-
-        Raises:
-            ConfigError: If AWS connection cannot be established.
-        """
-        try:
-            import boto3
-            from botocore.exceptions import ClientError, NoCredentialsError
-
-            # Build session based on config
-            session_kwargs = {"region_name": self._aws_config.region}
-
-            if self._aws_config.use_local_credentials:
-                if self._aws_config.credentials_path:
-                    # Use specific credentials file
-                    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(
-                        self._aws_config.credentials_path
-                    )
-                # Otherwise boto3 will use default ~/.aws/credentials
-
-            session = boto3.Session(**session_kwargs)
-
-            # Test connection with STS get-caller-identity
-            sts = session.client("sts")
-            identity = sts.get_caller_identity()
-
-            # Store identity info in config for reference
-            self._set_nested("aws.account_id", identity.get("Account"))
-            self._set_nested("aws.arn", identity.get("Arn"))
-
-        except NoCredentialsError:
-            raise ConfigError(
-                "AWS credentials not found. Configure credentials or set "
-                "use_local_credentials=true in config."
-            )
-        except ClientError as e:
-            raise ConfigError(f"Failed to connect to AWS: {e}")
-        except ImportError:
-            raise ConfigError("boto3 is required but not installed")
 
     def _merge_config(self, new_data: Dict[str, Any]) -> None:
         """Deep merge new configuration data into existing config."""
@@ -564,13 +490,6 @@ class Config:
             raise ConfigError(f"Required configuration key not found: {key}")
         return value
 
-    @property
-    def aws(self) -> AWSConfig:
-        """Get AWS-specific configuration."""
-        if not self._loaded:
-            self.load()
-        return self._aws_config
-
     def get_for_environment(self, key: str, default: Any = None) -> Any:
         """
         Get configuration value for the current environment.
@@ -588,15 +507,19 @@ class Config:
             >>> # With environment="dev" and project.buckets.dev="my-dev-bucket"
             >>> config.get_for_environment('project.buckets')
             'my-dev-bucket'
-
-            >>> # Equivalent to:
-            >>> config.get('project.buckets.dev')
         """
         if not self.environment:
             return default
 
         env_key = f"{key}.{self.environment}"
         return self.get(env_key, default)
+
+    @property
+    def aws(self) -> AWSConfig:
+        """Get AWS-specific configuration."""
+        if not self._loaded:
+            self.load()
+        return self._aws_config
 
     @property
     def environment(self) -> str | None:
@@ -609,17 +532,13 @@ class Config:
             self.load()
         return self._config.copy()
 
+    @classmethod
+    def reset(cls) -> None:
+        """Reset singleton instance. Primarily for testing."""
+        with cls._lock:
+            cls._instance = None
+
     def __repr__(self) -> str:
         status = "loaded" if self._loaded else "not loaded"
         env = self.environment or "unknown"
         return f"Config(environment={env}, status={status}, singleton=True)"
-
-    @classmethod
-    def reset(cls) -> None:
-        """
-        Reset singleton instance. Primarily for testing purposes.
-
-        Warning: Use with caution in production code.
-        """
-        with cls._lock:
-            cls._instance = None
